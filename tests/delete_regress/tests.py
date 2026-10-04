@@ -2,6 +2,7 @@ import datetime
 
 from django.db import connection, models, transaction
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
+from django.test.utils import CaptureQueriesContext
 
 from .models import (
     Award, AwardNote, Book, Child, Contact, Eaten, Email, File, Food, FooFile,
@@ -342,6 +343,38 @@ class DeleteTests(TestCase):
         OrderedPerson.objects.create(name='Bob', lives_in=h)
         OrderedPerson.objects.filter(lives_in__address='Foo').delete()
         self.assertEqual(OrderedPerson.objects.count(), 0)
+
+    def test_only_pks_are_selected_for_generic_relation_deletes(self):
+        person = Person.objects.create(name='Nelson Mandela')
+        Award.objects.create(name='Nobel', content_object=person)
+
+        with CaptureQueriesContext(connection) as queries:
+            person.delete()
+
+        self.assertTrue(any(
+            'SELECT "delete_regress_award"."id" FROM "delete_regress_award"' in q['sql']
+            for q in queries.captured_queries
+        ))
+        self.assertFalse(any(
+            '"delete_regress_award"."name"' in q['sql']
+            for q in queries.captured_queries
+        ))
+
+    def test_only_pks_are_selected_for_cascade_deletes(self):
+        orgunit = OrgUnit.objects.create(name='Engineering')
+        Login.objects.create(description='user', orgunit=orgunit)
+
+        with CaptureQueriesContext(connection) as queries:
+            orgunit.delete()
+
+        self.assertTrue(any(
+            'SELECT "delete_regress_login"."id" FROM "delete_regress_login"' in q['sql']
+            for q in queries.captured_queries
+        ))
+        self.assertFalse(any(
+            '"delete_regress_login"."description"' in q['sql']
+            for q in queries.captured_queries
+        ))
 
     def test_foreign_key_delete_nullifies_correct_columns(self):
         """

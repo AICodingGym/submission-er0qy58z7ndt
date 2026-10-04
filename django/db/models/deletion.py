@@ -234,7 +234,7 @@ class Collector:
         """
         return related.related_model._base_manager.using(self.using).filter(
             **{"%s__in" % related.field.name: objs}
-        )
+        ).only('pk')
 
     def instances_with_model(self):
         for model, instances in self.data.items():
