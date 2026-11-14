@@ -150,6 +150,7 @@ def train_model(
     patience: int = 20,
     requested_device: str = "auto",
     hidden_size: int = 1024,
+    learning_rate_schedule: list[float] | None = None,
 ):
     """Train with scored-row MAE loss; return model and best epoch."""
     random.seed(seed)
@@ -192,12 +193,17 @@ def train_model(
     )
 
     best_state = None
+    best_schedule: list[float] = []
+    learning_rates_used: list[float] = []
     best_mae = float("inf")
     best_epoch = 0
     last_epoch = 0
     stale_epochs = 0
     rng = np.random.default_rng(seed)
     for epoch in range(1, epochs + 1):
+        if learning_rate_schedule is not None:
+            optimizer.param_groups[0]["lr"] = learning_rate_schedule[epoch - 1]
+        learning_rates_used.append(float(optimizer.param_groups[0]["lr"]))
         last_epoch = epoch
         model.train()
         order = rng.permutation(train_idx)
@@ -219,7 +225,10 @@ def train_model(
             scored_count += int(mask_batch.sum())
 
         if valid_idx is None:
-            print(f"epoch {epoch:03d} train scored MAE={total_loss / scored_count:.5f}", flush=True)
+            train_mae = total_loss / scored_count
+            if learning_rate_schedule is None:
+                scheduler.step(train_mae)
+            print(f"epoch {epoch:03d} train scored MAE={train_mae:.5f}", flush=True)
             continue
 
         val_pred = predict_in_batches(model, X, valid_idx, batch_size) * target_std + target_mean
@@ -238,6 +247,7 @@ def train_model(
             best_mae = val_mae
             best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
+            best_schedule = learning_rates_used.copy()
             stale_epochs = 0
         else:
             stale_epochs += 1
@@ -248,7 +258,9 @@ def train_model(
     if valid_idx is not None and best_state is not None:
         model.load_state_dict(best_state)
     reported_epoch = best_epoch if valid_idx is not None else last_epoch
-    return model, reported_epoch, best_mae, feature_mean, feature_std, target_mean, target_std
+    if valid_idx is None and learning_rate_schedule is None:
+        best_schedule = learning_rates_used
+    return model, reported_epoch, best_mae, feature_mean, feature_std, target_mean, target_std, best_schedule
 
 
 def breath_group_split(breath_ids: np.ndarray, valid_size: float, seed: int):
@@ -286,7 +298,7 @@ def main() -> None:
             f"{len(valid_idx):,} validation breaths",
             flush=True,
         )
-        selection_model, selected_epochs, selection_mae, *_ = train_model(
+        selection_model, selected_epochs, selection_mae, _, _, _, _, selected_lr_schedule = train_model(
             X_train, y_train, u_out_train, fit_idx, valid_idx,
             epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
             patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
@@ -294,10 +306,11 @@ def main() -> None:
         print(f"Selected epoch {selected_epochs} (validation MAE {selection_mae:.6f})", flush=True)
         del selection_model
         gc.collect()
-        model, _, _, mean, std, target_mean, target_std = train_model(
+        model, _, _, mean, std, target_mean, target_std, _ = train_model(
             X_train, y_train, u_out_train, train_idx, None,
             epochs=selected_epochs, batch_size=args.batch_size, seed=args.seed,
             patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
+            learning_rate_schedule=selected_lr_schedule,
         )
         normalized_test = torch.from_numpy(((X_test - mean) / std).astype(np.float32)).to(
             next(model.parameters()).device
