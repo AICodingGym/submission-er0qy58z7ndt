@@ -1,17 +1,10 @@
-"""Whole-breath sequence-to-sequence MLP for ventilator pressures.
+"""Bidirectional GRU for ventilator pressure. One run = one seed.
 
-Run ``python3 sequence_model.py`` for breath-grouped validation.
-Run ``python3 sequence_model.py --predict --output sequence_submission.csv``
-to fit on all training breaths and write a submission file.
+Validation mode (default): trains on 85% of breaths, prints masked MAE each epoch,
+saves validation + test predictions for ensembling/blending.
+--full: trains on all breaths (no validation), saves test predictions.
 """
-
-from __future__ import annotations
-
-import argparse
-import copy
-import gc
-import os
-import random
+import argparse, copy, time, math
 from pathlib import Path
 
 import numpy as np
@@ -19,324 +12,168 @@ import pandas as pd
 import torch
 from sklearn.model_selection import GroupShuffleSplit
 from torch import nn
-from torch.nn import functional as F
-
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
-SEQ_LEN = 80
+SEQ = 80
+CONT = [
+    "time_step", "step", "dt", "u_in", "u_out", "R", "C", "R_over_C",
+    "u_in_cumsum", "u_in_volume", "u_in_cummax",
+    "u_in_lag1", "u_in_lag2", "u_in_lag3", "u_in_lead1", "u_in_lead2",
+    "u_in_diff1", "u_in_diff2", "u_out_change",
+]
+R_VALS, C_VALS = [5, 20, 50], [10, 20, 50]
 
 
-def prepare_sequences(frame: pd.DataFrame, with_target: bool = False):
-    """Sort rows into breaths and return features, row mappings, and metadata."""
-    frame = frame.copy()
-    frame["_row_order"] = np.arange(len(frame), dtype=np.int32)
-    frame = frame.sort_values(["breath_id", "time_step"], kind="stable").reset_index(drop=True)
-    groups = frame.groupby("breath_id", sort=False)
-    frame["step"] = groups.cumcount().astype(np.float32) / (SEQ_LEN - 1)
-    frame["dt"] = groups["time_step"].diff().fillna(0)
-    frame["u_in_cumsum"] = groups["u_in"].cumsum()
-    frame["_u_in_dt"] = frame["u_in"] * frame["dt"]
-    frame["u_in_volume"] = frame.groupby("breath_id", sort=False)["_u_in_dt"].cumsum()
-    frame["u_in_delta"] = groups["u_in"].diff().fillna(0)
-    frame["R_over_C"] = frame["R"] / frame["C"]
+def build(frame, with_target):
+    f = frame.copy()
+    f["_row"] = np.arange(len(f))
+    f = f.sort_values(["breath_id", "time_step"], kind="stable").reset_index(drop=True)
+    g = f.groupby("breath_id", sort=False)
+    f["step"] = g.cumcount() / (SEQ - 1)
+    f["dt"] = g["time_step"].diff().fillna(0)
+    f["u_in_cumsum"] = g["u_in"].cumsum()
+    f["_uin_dt"] = f["u_in"] * f["dt"]
+    f["u_in_volume"] = f.groupby("breath_id", sort=False)["_uin_dt"].cumsum()
+    f["u_in_cummax"] = g["u_in"].cummax()
+    for k in (1, 2, 3):
+        f[f"u_in_lag{k}"] = g["u_in"].shift(k).fillna(0)
+    for k in (1, 2):
+        f[f"u_in_lead{k}"] = g["u_in"].shift(-k).fillna(0)
+    f["u_in_diff1"] = f["u_in"] - f["u_in_lag1"]
+    f["u_in_diff2"] = f["u_in"] - f["u_in_lag2"]
+    f["u_out_change"] = g["u_out"].diff().fillna(0)
+    f["R_over_C"] = f["R"] / f["C"]
+    cols = list(CONT)
+    for r in R_VALS:
+        f[f"R_{r}"] = (f["R"] == r).astype(np.float32); cols.append(f"R_{r}")
+    for c in C_VALS:
+        f[f"C_{c}"] = (f["C"] == c).astype(np.float32); cols.append(f"C_{c}")
+    for r in R_VALS:
+        for c in C_VALS:
+            f[f"RC_{r}_{c}"] = ((f["R"] == r) & (f["C"] == c)).astype(np.float32)
+            cols.append(f"RC_{r}_{c}")
 
-    sizes = groups.size().to_numpy()
-    if not np.all(sizes == SEQ_LEN):
-        raise ValueError(f"Expected {SEQ_LEN} rows per breath; got sizes {np.unique(sizes)}")
-    n_breaths = len(sizes)
-    u_in = frame["u_in"].to_numpy(dtype=np.float32).reshape(n_breaths, SEQ_LEN)
-    u_out_seq = frame["u_out"].to_numpy(dtype=np.float32).reshape(n_breaths, SEQ_LEN)
-
-    def past(values: np.ndarray, lag: int) -> np.ndarray:
-        result = np.zeros_like(values)
-        result[:, lag:] = values[:, :-lag]
-        return result
-
-    def future(values: np.ndarray, lead: int) -> np.ndarray:
-        result = np.zeros_like(values)
-        result[:, :-lead] = values[:, lead:]
-        return result
-
-    feature_map = {
-        name: frame[name].to_numpy(dtype=np.float32).reshape(n_breaths, SEQ_LEN)
-        for name in (
-            "time_step", "step", "R", "C", "R_over_C", "dt",
-            "u_in_cumsum", "u_in_volume", "u_in_delta",
-        )
-    }
-    feature_map["u_in"] = u_in
-    feature_map["u_out"] = u_out_seq
-    feature_map["u_in_R"] = u_in * feature_map["R"]
-    feature_map["u_in_C"] = u_in * feature_map["C"]
-    feature_map["u_in_RC"] = u_in * feature_map["R"] * feature_map["C"]
-    for signal, values, offsets in (
-        ("u_in", u_in, (1, 2, 3, 5, 10, 20)),
-        ("u_out", u_out_seq, (1, 2, 3, 5, 10)),
-    ):
-        for offset in offsets:
-            feature_map[f"{signal}_lag{offset}"] = past(values, offset)
-            feature_map[f"{signal}_lead{offset}"] = future(values, offset)
-    feature_map["u_in_delta_forward"] = future(u_in, 1) - u_in
-
-    cumulative = np.cumsum(u_in, axis=1)
-    reverse_cumulative = np.flip(np.cumsum(np.flip(u_in, axis=1), axis=1), axis=1)
-    for window in (3, 5, 10, 20):
-        prior_cumulative = past(cumulative, window)
-        feature_map[f"u_in_past_sum{window}"] = cumulative - prior_cumulative
-        feature_map[f"u_in_past_mean{window}"] = feature_map[f"u_in_past_sum{window}"] / window
-        future_start = future(reverse_cumulative, 1)
-        future_end = future(reverse_cumulative, window + 1) if window + 1 < SEQ_LEN else np.zeros_like(u_in)
-        feature_map[f"u_in_future_sum{window}"] = future_start - future_end
-        feature_map[f"u_in_future_mean{window}"] = feature_map[f"u_in_future_sum{window}"] / window
-
-    X = np.stack(list(feature_map.values()), axis=-1).astype(np.float32, copy=False)
-    row_order = frame["_row_order"].to_numpy().reshape(n_breaths, SEQ_LEN)
-    breath_ids = frame.groupby("breath_id", sort=False)["breath_id"].first().to_numpy()
-    u_out = frame["u_out"].to_numpy(dtype=np.int8).reshape(n_breaths, SEQ_LEN)
-    y = None
-    if with_target:
-        y = frame["pressure"].to_numpy(dtype=np.float32).reshape(n_breaths, SEQ_LEN)
-    return X, y, u_out, breath_ids, row_order
+    sizes = f.groupby("breath_id", sort=False).size().to_numpy()
+    assert np.all(sizes == SEQ), "every breath must have 80 rows"
+    n = len(sizes)
+    X = f[cols].to_numpy(np.float32).reshape(n, SEQ, -1)
+    u_out = f["u_out"].to_numpy(np.int8).reshape(n, SEQ)
+    rows = f["_row"].to_numpy().reshape(n, SEQ)
+    bids = f["breath_id"].to_numpy().reshape(n, SEQ)[:, 0]
+    y = f["pressure"].to_numpy(np.float32).reshape(n, SEQ) if with_target else None
+    return X, y, u_out, bids, rows
 
 
-class BreathSequenceMLP(nn.Module):
-    """Map the complete control sequence for one breath to all 80 pressures."""
-
-    def __init__(self, input_size: int, hidden_size: int = 1024):
+class Net(nn.Module):
+    def __init__(self, n_in, hid, layers, dropout):
         super().__init__()
-        flat_size = SEQ_LEN * input_size
-        self.encoder = nn.Sequential(
-            nn.Linear(flat_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(0.10),
-            nn.Linear(hidden_size // 2, SEQ_LEN),
-        )
-        self.skip = nn.Linear(flat_size, SEQ_LEN)
+        self.embed = nn.Sequential(nn.Linear(n_in, hid), nn.LayerNorm(hid), nn.GELU())
+        self.gru = nn.GRU(hid, hid, num_layers=layers, batch_first=True, bidirectional=True,
+                          dropout=dropout if layers > 1 else 0.0)
+        self.head = nn.Sequential(nn.Linear(2 * hid, hid), nn.GELU(), nn.Linear(hid, 1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        flattened = x.flatten(start_dim=1)
-        return self.encoder(flattened) + self.skip(flattened)
+    def forward(self, x):
+        out, _ = self.gru(self.embed(x))
+        return self.head(out).squeeze(-1)
 
 
-def predict_in_batches(model, features: torch.Tensor, indices: np.ndarray, batch_size: int) -> np.ndarray:
+@torch.no_grad()
+def predict(model, X, bs):
     model.eval()
-    outputs = []
-    with torch.inference_mode():
-        for start in range(0, len(indices), batch_size):
-            idx = torch.as_tensor(indices[start:start + batch_size], dtype=torch.long, device=features.device)
-            outputs.append(model(features[idx]).cpu().numpy())
-    return np.concatenate(outputs, axis=0)
+    return torch.cat([model(X[i:i + bs]).float().cpu() for i in range(0, len(X), bs)]).numpy()
 
 
-def train_model(
-    features: np.ndarray,
-    targets: np.ndarray,
-    u_out: np.ndarray,
-    train_idx: np.ndarray,
-    valid_idx: np.ndarray | None,
-    *,
-    epochs: int,
-    batch_size: int,
-    seed: int,
-    patience: int = 20,
-    requested_device: str = "auto",
-    hidden_size: int = 1024,
-    learning_rate_schedule: list[float] | None = None,
-):
-    """Train with scored-row MAE loss; return model and best epoch."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if requested_device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split-seed", type=int, default=42)   # keep 42 so LightGBM uses the same breaths
+    p.add_argument("--valid-size", type=float, default=0.15)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--layers", type=int, default=3)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--exp-weight", type=float, default=0.0,
+                   help="loss weight on expiratory (unscored) steps; 0 = scored steps only")
+    p.add_argument("--full", action="store_true", help="train on all breaths, no validation")
+    a = p.parse_args()
+
+    device = ("cuda" if torch.cuda.is_available()
+              else "mps" if torch.backends.mps.is_available() else "cpu")
+    print("device:", device, flush=True)
+    torch.manual_seed(a.seed); np.random.seed(a.seed)
+
+    train = pd.read_csv(DATA / "train.csv")
+    test = pd.read_csv(DATA / "test.csv")
+    X, y, u_out, bids, rows = build(train, True)
+    Xt, _, _, _, trows = build(test, False)
+    n = len(X)
+
+    if a.full:
+        tr, va = np.arange(n), None
     else:
-        device = torch.device(requested_device)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is unavailable")
-        if device.type == "mps" and not torch.backends.mps.is_available():
-            raise RuntimeError("MPS was requested but is unavailable")
-    if device.type == "cpu":
-        torch.set_num_threads(min(8, max(1, (os.cpu_count() or 4) - 1)))
-    print(f"Training device: {device}", flush=True)
+        tr, va = next(GroupShuffleSplit(1, test_size=a.valid_size, random_state=a.split_seed)
+                      .split(np.arange(n), groups=bids))
+        print(f"train breaths {len(tr):,}  validation breaths {len(va):,}", flush=True)
 
-    feature_mean = features[train_idx].reshape(-1, features.shape[-1]).mean(axis=0)
-    feature_std = features[train_idx].reshape(-1, features.shape[-1]).std(axis=0)
-    feature_std[feature_std < 1e-6] = 1.0
-    target_rows = u_out[train_idx] == 0
-    target_values = targets[train_idx][target_rows]
-    target_mean = float(target_values.mean())
-    target_std = float(target_values.std())
-    if target_std < 1e-6:
-        target_std = 1.0
+    mean = X[tr].reshape(-1, X.shape[-1]).mean(0)
+    std = X[tr].reshape(-1, X.shape[-1]).std(0); std[std < 1e-6] = 1.0
+    scored = u_out[tr] == 0
+    ymean, ystd = float(y[tr][scored].mean()), float(y[tr][scored].std())
 
-    X = torch.from_numpy(((features - feature_mean) / feature_std).astype(np.float32)).to(device)
-    Y = torch.from_numpy(((targets - target_mean) / target_std).astype(np.float32)).to(device)
-    mask = torch.from_numpy(u_out == 0).to(device)
-    model = BreathSequenceMLP(features.shape[-1], hidden_size=hidden_size).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
-    )
+    Xn = torch.from_numpy((X - mean) / std).float()
+    Yn = torch.from_numpy((y - ymean) / ystd).float()
+    Mk = torch.from_numpy(u_out == 0)
+    Xtn = torch.from_numpy((Xt - mean) / std).float().to(device)
+    Xtr, Ytr, Mtr = Xn[tr].to(device), Yn[tr].to(device), Mk[tr].to(device)
+    Xva = Xn[va].to(device) if va is not None else None
 
-    best_state = None
-    best_schedule: list[float] = []
-    learning_rates_used: list[float] = []
-    best_mae = float("inf")
-    best_epoch = 0
-    last_epoch = 0
-    stale_epochs = 0
-    rng = np.random.default_rng(seed)
-    for epoch in range(1, epochs + 1):
-        if learning_rate_schedule is not None:
-            optimizer.param_groups[0]["lr"] = learning_rate_schedule[epoch - 1]
-        learning_rates_used.append(float(optimizer.param_groups[0]["lr"]))
-        last_epoch = epoch
-        model.train()
-        order = rng.permutation(train_idx)
-        total_loss = 0.0
-        scored_count = 0
-        for start in range(0, len(order), batch_size):
-            batch_idx = order[start:start + batch_size]
-            idx = torch.as_tensor(batch_idx, dtype=torch.long, device=device)
-            x_batch = X[idx]
-            y_batch = Y[idx]
-            mask_batch = mask[idx]
-            optimizer.zero_grad(set_to_none=True)
-            prediction = model(x_batch)
-            loss = F.l1_loss(prediction[mask_batch], y_batch[mask_batch])
+    model = Net(X.shape[-1], a.hidden, a.layers, a.dropout).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
+    steps = math.ceil(len(tr) / a.batch_size)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, epochs=a.epochs, steps_per_epoch=steps)
+
+    best, best_state = float("inf"), None
+    for ep in range(1, a.epochs + 1):
+        t0 = time.time(); model.train()
+        perm = torch.randperm(len(tr)).to(device)
+        for i in range(0, len(tr), a.batch_size):
+            idx = perm[i:i + a.batch_size]
+            pred = model(Xtr[idx])
+            w = Mtr[idx].float() + a.exp_weight * (~Mtr[idx]).float()
+            loss = ((pred - Ytr[idx]).abs() * w).sum() / w.sum()      # plain L1
+            opt.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss += float(loss.detach()) * int(mask_batch.sum())
-            scored_count += int(mask_batch.sum())
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); sched.step()
+        msg = f"epoch {ep:03d}  {time.time() - t0:5.0f}s  train L1={float(loss) * ystd:.4f}"
+        if va is not None:
+            pv = predict(model, Xva, 1024) * ystd + ymean
+            m = u_out[va] == 0
+            mae = float(np.abs(pv[m] - y[va][m]).mean())
+            msg += f"  val MAE={mae:.5f}"
+            if mae < best:
+                best, best_state = mae, copy.deepcopy(model.state_dict())
+        print(msg, flush=True)
 
-        if valid_idx is None:
-            train_mae = total_loss / scored_count
-            if learning_rate_schedule is None:
-                scheduler.step(train_mae)
-            print(f"epoch {epoch:03d} train scored MAE={train_mae:.5f}", flush=True)
-            continue
-
-        val_pred = predict_in_batches(model, X, valid_idx, batch_size) * target_std + target_mean
-        pressure_min = float(targets[train_idx].min())
-        pressure_max = float(targets[train_idx].max())
-        val_pred = np.clip(val_pred, pressure_min, pressure_max)
-        val_mask = u_out[valid_idx] == 0
-        val_mae = float(np.abs(val_pred[val_mask] - targets[valid_idx][val_mask]).mean())
-        scheduler.step(val_mae)
-        print(
-            f"epoch {epoch:03d} train scored MAE={total_loss / scored_count:.5f} "
-            f"validation inspiratory MAE={val_mae:.6f}",
-            flush=True,
-        )
-        if val_mae < best_mae:
-            best_mae = val_mae
-            best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
-            best_schedule = learning_rates_used.copy()
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-            if stale_epochs >= patience:
-                print(f"Early stopping at epoch {epoch}; best epoch {best_epoch}", flush=True)
-                break
-
-    if valid_idx is not None and best_state is not None:
+    if best_state is not None:
         model.load_state_dict(best_state)
-    reported_epoch = best_epoch if valid_idx is not None else last_epoch
-    if valid_idx is None and learning_rate_schedule is None:
-        best_schedule = learning_rates_used
-    return model, reported_epoch, best_mae, feature_mean, feature_std, target_mean, target_std, best_schedule
+        print(f"best validation MAE: {best:.5f}")
 
-
-def breath_group_split(breath_ids: np.ndarray, valid_size: float, seed: int):
-    indices = np.arange(len(breath_ids))
-    splitter = GroupShuffleSplit(n_splits=1, test_size=valid_size, random_state=seed)
-    return next(splitter.split(indices, groups=breath_ids))
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--predict", action="store_true", help="fit all training breaths and write a submission")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--valid-size", type=float, default=0.15)
-    parser.add_argument("--epochs", type=int, default=120)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--hidden-size", type=int, default=1024)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
-    parser.add_argument("--output", type=Path, default=ROOT / "sequence_submission.csv")
-    args = parser.parse_args()
-
-    train = pd.read_csv(DATA / "train.csv", dtype={"R": "int8", "C": "int8", "u_out": "int8"})
-    X_train, y_train, u_out_train, breath_ids, train_rows = prepare_sequences(train, with_target=True)
-    del train
-
-    if args.predict:
-        test = pd.read_csv(DATA / "test.csv", dtype={"R": "int8", "C": "int8", "u_out": "int8"})
-        X_test, _, _, _, test_rows = prepare_sequences(test, with_target=False)
-        test_ids = test["id"].to_numpy()
-        del test
-        train_idx = np.arange(len(X_train))
-        fit_idx, valid_idx = breath_group_split(breath_ids, args.valid_size, args.seed)
-        print(
-            f"Selecting epochs on {len(fit_idx):,} fit breaths and "
-            f"{len(valid_idx):,} validation breaths",
-            flush=True,
-        )
-        selection_model, selected_epochs, selection_mae, _, _, _, _, selected_lr_schedule = train_model(
-            X_train, y_train, u_out_train, fit_idx, valid_idx,
-            epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
-            patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
-        )
-        print(f"Selected epoch {selected_epochs} (validation MAE {selection_mae:.6f})", flush=True)
-        del selection_model
-        gc.collect()
-        model, _, _, mean, std, target_mean, target_std, _ = train_model(
-            X_train, y_train, u_out_train, train_idx, None,
-            epochs=selected_epochs, batch_size=args.batch_size, seed=args.seed,
-            patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
-            learning_rate_schedule=selected_lr_schedule,
-        )
-        normalized_test = torch.from_numpy(((X_test - mean) / std).astype(np.float32)).to(
-            next(model.parameters()).device
-        )
-        test_idx = np.arange(len(X_test))
-        pred_scaled = predict_in_batches(model, normalized_test, test_idx, args.batch_size)
-        pred_sequence = np.clip(
-            pred_scaled * target_std + target_mean,
-            float(y_train.min()),
-            float(y_train.max()),
-        )
-        pred_rows = np.empty(len(test_ids), dtype=np.float32)
-        pred_rows[test_rows.reshape(-1)] = pred_sequence.reshape(-1)
-        submission = pd.DataFrame({"id": test_ids, "pressure": pred_rows})
-        submission.to_csv(args.output, index=False)
-        print(f"Wrote {args.output} ({len(submission):,} predictions; {selected_epochs} epochs)")
-        return
-
-    train_idx, valid_idx = breath_group_split(breath_ids, args.valid_size, args.seed)
-    print(f"Training on {len(train_idx):,} breaths; validating on {len(valid_idx):,} breaths", flush=True)
-    _, best_epoch, best_mae, *_ = train_model(
-        X_train, y_train, u_out_train, train_idx, valid_idx,
-        epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
-        patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
-    )
-    print(f"Breath-grouped sequence-model scored MAE: {best_mae:.6f} (epoch {best_epoch})")
+    tag = f"seed{a.seed}"
+    if va is not None:
+        pv = predict(model, Xva, 1024) * ystd + ymean
+        np.save(ROOT / f"seq_val_{tag}.npy", pv.reshape(-1))
+        np.save(ROOT / "seq_val_rows.npy", rows[va].reshape(-1))
+    pt = predict(model, Xtn, 1024) * ystd + ymean
+    out = np.empty(len(test), dtype=np.float32)
+    out[trows.reshape(-1)] = pt.reshape(-1)
+    np.save(ROOT / f"seq_test{'_full' if a.full else ''}_{tag}.npy", out)
+    sub = ROOT / f"submission_seq_{tag}.csv"
+    pd.DataFrame({"id": test["id"].to_numpy(), "pressure": out}).to_csv(sub, index=False)
+    print("wrote", sub)
 
 
 if __name__ == "__main__":
