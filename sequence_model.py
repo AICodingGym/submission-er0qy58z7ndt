@@ -1,15 +1,21 @@
-Sequence model · PY
-"""Bidirectional GRU for ventilator pressure. One run = one seed.
+
+"""Bidirectional conv+GRU for ventilator pressure (v3). One run = one seed.
  
-Validation mode (default): trains on 85% of breaths (split fixed by --split-seed),
-prints masked MAE each epoch, saves the epoch curve, raw validation predictions
-and raw test predictions for ensembling/blending (see blend.py).
---full: trains on all breaths (no validation), saves test predictions.
+Main changes vs v2 (diagnosed from the training-log arithmetic, see chat):
+  * batch 128 + long schedules -> ~10-20x more optimizer steps than v2 (which got ~4.5k).
+  * --minutes N : cosine LR schedule driven by wall-clock time, so a run always finishes
+    and uses the whole budget.  (--epochs N still works if --minutes is 0.)
+  * EMA of weights (evaluated and saved), conv front-end, residual skip into the head.
+  * breath-level and physics features (u_in*R, volume/C, relative position in inspiration...).
  
-Ensemble example (same validation breaths, different model seeds):
-    for s in 42 43 44; do python3 sequence_model.py --seed $s --split-seed 42; done
+Validation mode: trains on 85% of breaths (split fixed by --split-seed), saves raw EMA
+predictions for blend.py.  --full trains on all breaths.  --limit-breaths N is a smoke test.
+ 
+Examples:
+    python3 sequence_model.py --limit-breaths 600 --epochs 2          # smoke test
+    python3 sequence_model.py --seed 42 --minutes 60                  # one real run
 """
-import argparse, copy, time, math
+import argparse, copy, math, time
 from pathlib import Path
  
 import numpy as np
@@ -17,6 +23,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import GroupShuffleSplit
 from torch import nn
+from torch.nn import functional as F
  
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -26,6 +33,8 @@ CONT = [
     "u_in_cumsum", "u_in_volume", "u_in_cummax",
     "u_in_lag1", "u_in_lag2", "u_in_lag3", "u_in_lead1", "u_in_lead2",
     "u_in_diff1", "u_in_diff2", "u_out_change",
+    # physics-motivated products and breath-level context
+    "u_in_R", "vol_over_C", "cum_over_C", "insp_pos", "b_uin_sum", "b_uin_max", "b_insp_len",
 ]
 R_VALS, C_VALS = [5, 20, 50], [10, 20, 50]
  
@@ -35,7 +44,8 @@ def build(frame, with_target):
     f["_row"] = np.arange(len(f))
     f = f.sort_values(["breath_id", "time_step"], kind="stable").reset_index(drop=True)
     g = f.groupby("breath_id", sort=False)
-    f["step"] = g.cumcount() / (SEQ - 1)
+    f["_pos"] = g.cumcount()
+    f["step"] = f["_pos"] / (SEQ - 1)
     f["dt"] = g["time_step"].diff().fillna(0)
     f["u_in_cumsum"] = g["u_in"].cumsum()
     f["_uin_dt"] = f["u_in"] * f["dt"]
@@ -49,6 +59,16 @@ def build(frame, with_target):
     f["u_in_diff2"] = f["u_in"] - f["u_in_lag2"]
     f["u_out_change"] = g["u_out"].diff().fillna(0)
     f["R_over_C"] = f["R"] / f["C"]
+    f["u_in_R"] = f["u_in"] * f["R"]
+    f["vol_over_C"] = f["u_in_volume"] / f["C"]
+    f["cum_over_C"] = f["u_in_cumsum"] / f["C"]
+    f["_ins"] = (f["u_out"] == 0).astype(np.float32)
+    f["_ui"] = f["u_in"] * f["_ins"]
+    g = f.groupby("breath_id", sort=False)
+    f["b_uin_sum"] = g["_ui"].transform("sum")
+    f["b_uin_max"] = g["u_in"].transform("max")
+    f["b_insp_len"] = g["_ins"].transform("sum")
+    f["insp_pos"] = f["_pos"] / f["b_insp_len"].clip(lower=1)
     cols = list(CONT)
     for r in R_VALS:
         f[f"R_{r}"] = (f["R"] == r).astype(np.float32); cols.append(f"R_{r}")
@@ -74,17 +94,21 @@ class Net(nn.Module):
     def __init__(self, n_in, hid, layers, dropout):
         super().__init__()
         self.embed = nn.Sequential(nn.Linear(n_in, hid), nn.LayerNorm(hid), nn.GELU())
+        self.conv = nn.Conv1d(hid, hid, kernel_size=5, padding=2)   # local shape of the control signal
+        self.norm = nn.LayerNorm(hid)
         self.gru = nn.GRU(hid, hid, num_layers=layers, batch_first=True, bidirectional=True,
                           dropout=dropout if layers > 1 else 0.0)
-        self.head = nn.Sequential(nn.Linear(2 * hid, hid), nn.GELU(), nn.Linear(hid, 1))
+        self.head = nn.Sequential(nn.Linear(3 * hid, hid), nn.GELU(), nn.Linear(hid, 1))
  
     def forward(self, x):
-        out, _ = self.gru(self.embed(x))
-        return self.head(out).squeeze(-1)
+        h = self.embed(x)
+        h = self.norm(h + F.gelu(self.conv(h.transpose(1, 2))).transpose(1, 2))
+        out, _ = self.gru(h)
+        return self.head(torch.cat([out, h], dim=-1)).squeeze(-1)
  
  
 @torch.no_grad()
-def predict(model, X, bs):
+def predict(model, X, bs=1024):
     model.eval()
     return torch.cat([model(X[i:i + bs]).float().cpu() for i in range(0, len(X), bs)]).numpy()
  
@@ -95,24 +119,31 @@ def main():
     p.add_argument("--split-seed", type=int, default=42,
                    help="validation split seed; keep 42 so every seed and LightGBM share breaths")
     p.add_argument("--valid-size", type=float, default=0.15)
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--minutes", type=float, default=0.0,
+                   help="wall-clock training budget; schedule follows time. 0 = use --epochs")
+    p.add_argument("--epochs", type=int, default=100, help="used only when --minutes is 0")
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--lr", type=float, default=1e-3, help="peak learning rate")
+    p.add_argument("--ema", type=float, default=0.999, help="EMA decay (0 disables)")
     p.add_argument("--exp-weight", type=float, default=0.0,
                    help="loss weight on expiratory (unscored) steps; 0 = scored steps only")
     p.add_argument("--full", action="store_true", help="train on all breaths, no validation")
+    p.add_argument("--limit-breaths", type=int, default=0, help="smoke test on the first N breaths")
     a = p.parse_args()
  
     device = ("cuda" if torch.cuda.is_available()
               else "mps" if torch.backends.mps.is_available() else "cpu")
     print("device:", device, flush=True)
     torch.manual_seed(a.seed); np.random.seed(a.seed)
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
  
-    train = pd.read_csv(DATA / "train.csv")
-    test = pd.read_csv(DATA / "test.csv")
+    nrows = a.limit_breaths * SEQ if a.limit_breaths else None
+    train = pd.read_csv(DATA / "train.csv", nrows=nrows)
+    test = pd.read_csv(DATA / "test.csv", nrows=nrows)
     X, y, u_out, bids, rows = build(train, True)
     Xt, _, _, _, trows = build(test, False)
     n = len(X)
@@ -128,7 +159,6 @@ def main():
     std = X[tr].reshape(-1, X.shape[-1]).std(0); std[std < 1e-6] = 1.0
     scored = u_out[tr] == 0
     ymean, ystd = float(y[tr][scored].mean()), float(y[tr][scored].std())
-    ylo, yhi = float(y[tr].min()), float(y[tr].max())
  
     Xn = torch.from_numpy((X - mean) / std).float()
     Yn = torch.from_numpy((y - ymean) / ystd).float()
@@ -138,51 +168,86 @@ def main():
     Xva = Xn[va].to(device) if va is not None else None
  
     model = Net(X.shape[-1], a.hidden, a.layers, a.dropout).to(device)
+    ema = copy.deepcopy(model).eval()
+    for q in ema.parameters():
+        q.requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    steps = math.ceil(len(tr) / a.batch_size)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, epochs=a.epochs, steps_per_epoch=steps)
  
+    nb = len(tr)
+    steps_per_epoch = math.ceil(nb / a.batch_size)
+    total_steps = steps_per_epoch * a.epochs
+    budget = a.minutes * 60.0
+    t_start = time.time()
+    print(f"{steps_per_epoch} steps/epoch; "
+          + (f"time budget {a.minutes:.0f} min" if budget else f"{total_steps:,} total steps"), flush=True)
+ 
+    def progress(step):
+        return (time.time() - t_start) / budget if budget else step / total_steps
+ 
+    def lr_at(pr, warm=0.03):
+        if pr < warm:
+            return a.lr * max(pr / warm, 0.02)
+        return a.lr * (0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * (pr - warm) / (1 - warm))))
+ 
+    def ema_update(step):
+        d = min(a.ema, (1 + step) / (10 + step))
+        with torch.no_grad():
+            for pe, pm in zip(ema.parameters(), model.parameters()):
+                pe.mul_(d).add_(pm.detach(), alpha=1 - d)
+ 
+    eval_model = ema if a.ema > 0 else model
     best, best_ep, best_state, curve = float("inf"), 0, None, []
-    for ep in range(1, a.epochs + 1):
-        t0 = time.time(); model.train()
-        perm = torch.randperm(len(tr)).to(device)
-        for i in range(0, len(tr), a.batch_size):
+    step, ep, done, run_loss = 0, 0, False, float("nan")
+    while not done:
+        ep += 1; t0 = time.time(); s0 = step
+        model.train()
+        perm = torch.randperm(nb, device=device)
+        for i in range(0, nb, a.batch_size):
+            pr = progress(step)
+            if pr >= 1.0:
+                done = True; break
+            for gr in opt.param_groups:
+                gr["lr"] = lr_at(pr)
             idx = perm[i:i + a.batch_size]
             pred = model(Xtr[idx])
             w = Mtr[idx].float() + a.exp_weight * (~Mtr[idx]).float()
-            loss = ((pred - Ytr[idx]).abs() * w).sum() / w.sum()      # plain L1
+            loss = ((pred - Ytr[idx]).abs() * w).sum() / w.sum()          # plain L1 on scored steps
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sched.step()
-        msg = f"epoch {ep:03d}  {time.time() - t0:5.0f}s  train L1={float(loss) * ystd:.4f}"
-        if va is not None:
-            pv = predict(model, Xva, 1024) * ystd + ymean
+            opt.step()
+            if a.ema > 0:
+                ema_update(step)
+            step += 1
+            if step == 1 or step % 50 == 0:
+                run_loss = float(loss) * ystd                              # also syncs the GPU queue
+        if not budget and ep >= a.epochs:
+            done = True
+        msg = (f"epoch {ep:03d}  {time.time() - t0:5.0f}s  {max(step - s0, 1) / max(time.time() - t0, 1e-9):5.1f} it/s  "
+               f"lr={lr_at(min(progress(step), 1.0)):.2e}  train L1~{run_loss:.4f}")
+        if va is not None and step > s0:
+            pv = predict(eval_model, Xva) * ystd + ymean
             m = u_out[va] == 0
             mae = float(np.abs(pv[m] - y[va][m]).mean())
-            curve.append((ep, mae))
+            curve.append((ep, step, mae))
             msg += f"  val MAE={mae:.5f}"
             if mae < best:
-                best, best_ep, best_state = mae, ep, copy.deepcopy(model.state_dict())
+                best, best_ep, best_state = mae, ep, copy.deepcopy(eval_model.state_dict())
         print(msg, flush=True)
  
     tag = f"seed{a.seed}"
     if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"best validation MAE: {best:.5f} at epoch {best_ep}/{a.epochs}")
-        if best_ep >= a.epochs - 2:
-            print("NOTE: best epoch is at the end of training -> try more epochs (e.g. 60-80).")
-        pd.DataFrame(curve, columns=["epoch", "val_mae"]).to_csv(ROOT / f"seq_curve_{tag}.csv", index=False)
+        eval_model.load_state_dict(best_state)
+        print(f"best validation MAE: {best:.5f} at epoch {best_ep}/{ep}  ({step:,} optimizer steps)")
+        if best_ep >= ep - 1:
+            print("NOTE: best epoch is the last one -> a longer budget (--minutes) should still help.")
+        pd.DataFrame(curve, columns=["epoch", "step", "val_mae"]).to_csv(ROOT / f"seq_curve_{tag}.csv", index=False)
  
     if va is not None:
-        pv = predict(model, Xva, 1024) * ystd + ymean          # RAW (unclipped) predictions
-        m = u_out[va] == 0
-        raw = float(np.abs(pv[m] - y[va][m]).mean())
-        clipped = float(np.abs(np.clip(pv, ylo, yhi)[m] - y[va][m]).mean())
-        print(f"validation MAE raw={raw:.5f}  clipped to [{ylo:.2f}, {yhi:.2f}]={clipped:.5f}")
+        pv = predict(eval_model, Xva) * ystd + ymean              # RAW predictions; blend.py decides on clipping
         np.save(ROOT / f"seq_val_{tag}.npy", pv.reshape(-1))
         np.save(ROOT / "seq_val_rows.npy", rows[va].reshape(-1))
-    pt = predict(model, Xtn, 1024) * ystd + ymean              # RAW; blend.py decides on clipping
+    pt = predict(eval_model, Xtn) * ystd + ymean
     out = np.empty(len(test), dtype=np.float32)
     out[trows.reshape(-1)] = pt.reshape(-1)
     np.save(ROOT / f"seq_test{'_full' if a.full else ''}_{tag}.npy", out)
