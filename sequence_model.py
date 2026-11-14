@@ -1,4 +1,4 @@
-"""Dilated temporal CNN sequence-to-sequence model for ventilator pressures.
+"""Whole-breath sequence-to-sequence MLP for ventilator pressures.
 
 Run ``python3 sequence_model.py`` for breath-grouped validation.
 Run ``python3 sequence_model.py --predict --output sequence_submission.csv``
@@ -100,48 +100,31 @@ def prepare_sequences(frame: pd.DataFrame, with_target: bool = False):
     return X, y, u_out, breath_ids, row_order
 
 
-class TemporalBlock(nn.Module):
-    def __init__(self, channels: int, dilation: int, dropout: float):
+class BreathSequenceMLP(nn.Module):
+    """Map the complete control sequence for one breath to all 80 pressures."""
+
+    def __init__(self, input_size: int, hidden_size: int = 1024):
         super().__init__()
-        padding = dilation
-        self.layers = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size=3, padding=padding, dilation=dilation),
-            nn.GroupNorm(8, channels),
+        flat_size = SEQ_LEN * input_size
+        self.encoder = nn.Sequential(
+            nn.Linear(flat_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(channels, channels, kernel_size=3, padding=padding, dilation=dilation),
-            nn.GroupNorm(8, channels),
-        )
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.activation(x + self.dropout(self.layers(x)))
-
-
-class BreathTCN(nn.Module):
-    """Dilated residual temporal CNN with receptive field spanning each breath."""
-
-    def __init__(self, input_size: int, channels: int = 128):
-        super().__init__()
-        self.input_projection = nn.Conv1d(input_size, channels, kernel_size=1)
-        self.blocks = nn.Sequential(*[
-            TemporalBlock(channels, dilation, dropout=0.10)
-            for dilation in (1, 2, 4, 8, 16, 32)
-        ])
-        self.head = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size=1),
-            nn.GroupNorm(8, channels),
+            nn.Dropout(0.15),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.GELU(),
             nn.Dropout(0.10),
-            nn.Conv1d(channels, 1, kernel_size=1),
+            nn.Linear(hidden_size // 2, SEQ_LEN),
         )
-        self.skip = nn.Conv1d(input_size, 1, kernel_size=1)
+        self.skip = nn.Linear(flat_size, SEQ_LEN)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)
-        sequence = self.blocks(self.input_projection(x))
-        return (self.head(sequence) + self.skip(x)).squeeze(1)
+        flattened = x.flatten(start_dim=1)
+        return self.encoder(flattened) + self.skip(flattened)
 
 
 def predict_in_batches(model, features: torch.Tensor, indices: np.ndarray, batch_size: int) -> np.ndarray:
@@ -164,10 +147,11 @@ def train_model(
     epochs: int,
     batch_size: int,
     seed: int,
-    patience: int = 8,
+    patience: int = 20,
     requested_device: str = "auto",
+    hidden_size: int = 1024,
 ):
-    """Train with scored-row SmoothL1 loss; return model and best epoch."""
+    """Train with scored-row MAE loss; return model and best epoch."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -201,7 +185,7 @@ def train_model(
     X = torch.from_numpy(((features - feature_mean) / feature_std).astype(np.float32)).to(device)
     Y = torch.from_numpy(((targets - target_mean) / target_std).astype(np.float32)).to(device)
     mask = torch.from_numpy(u_out == 0).to(device)
-    model = BreathTCN(features.shape[-1]).to(device)
+    model = BreathSequenceMLP(features.shape[-1], hidden_size=hidden_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
@@ -238,9 +222,12 @@ def train_model(
             print(f"epoch {epoch:03d} train scored MAE={total_loss / scored_count:.5f}", flush=True)
             continue
 
-        val_pred = predict_in_batches(model, X, valid_idx, batch_size)
+        val_pred = predict_in_batches(model, X, valid_idx, batch_size) * target_std + target_mean
+        pressure_min = float(targets[train_idx].min())
+        pressure_max = float(targets[train_idx].max())
+        val_pred = np.clip(val_pred, pressure_min, pressure_max)
         val_mask = u_out[valid_idx] == 0
-        val_mae = float(np.abs(val_pred[val_mask] * target_std + target_mean - targets[valid_idx][val_mask]).mean())
+        val_mae = float(np.abs(val_pred[val_mask] - targets[valid_idx][val_mask]).mean())
         scheduler.step(val_mae)
         print(
             f"epoch {epoch:03d} train scored MAE={total_loss / scored_count:.5f} "
@@ -278,6 +265,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--hidden-size", type=int, default=1024)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--output", type=Path, default=ROOT / "sequence_submission.csv")
     args = parser.parse_args()
@@ -301,7 +289,7 @@ def main() -> None:
         selection_model, selected_epochs, selection_mae, *_ = train_model(
             X_train, y_train, u_out_train, fit_idx, valid_idx,
             epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
-            patience=args.patience, requested_device=args.device,
+            patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
         )
         print(f"Selected epoch {selected_epochs} (validation MAE {selection_mae:.6f})", flush=True)
         del selection_model
@@ -309,19 +297,23 @@ def main() -> None:
         model, _, _, mean, std, target_mean, target_std = train_model(
             X_train, y_train, u_out_train, train_idx, None,
             epochs=selected_epochs, batch_size=args.batch_size, seed=args.seed,
-            patience=args.patience, requested_device=args.device,
+            patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
         )
         normalized_test = torch.from_numpy(((X_test - mean) / std).astype(np.float32)).to(
             next(model.parameters()).device
         )
         test_idx = np.arange(len(X_test))
         pred_scaled = predict_in_batches(model, normalized_test, test_idx, args.batch_size)
-        pred_sequence = pred_scaled * target_std + target_mean
+        pred_sequence = np.clip(
+            pred_scaled * target_std + target_mean,
+            float(y_train.min()),
+            float(y_train.max()),
+        )
         pred_rows = np.empty(len(test_ids), dtype=np.float32)
         pred_rows[test_rows.reshape(-1)] = pred_sequence.reshape(-1)
         submission = pd.DataFrame({"id": test_ids, "pressure": pred_rows})
         submission.to_csv(args.output, index=False)
-        print(f"Wrote {args.output} ({len(submission):,} predictions; {epochs_used} epochs)")
+        print(f"Wrote {args.output} ({len(submission):,} predictions; {selected_epochs} epochs)")
         return
 
     train_idx, valid_idx = breath_group_split(breath_ids, args.valid_size, args.seed)
@@ -329,7 +321,7 @@ def main() -> None:
     _, best_epoch, best_mae, *_ = train_model(
         X_train, y_train, u_out_train, train_idx, valid_idx,
         epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
-        patience=args.patience, requested_device=args.device,
+        patience=args.patience, requested_device=args.device, hidden_size=args.hidden_size,
     )
     print(f"Breath-grouped sequence-model scored MAE: {best_mae:.6f} (epoch {best_epoch})")
 
