@@ -152,6 +152,7 @@ def main() -> None:
     )
     pred = model.predict(x_train.iloc[valid_idx], num_threads=-1)
     mae = scored_mae(target[valid_idx], pred, train_u_out[valid_idx])
+    # Saved for blend.py: scored validation rows (original row indices) and predictions.
     np.save(ROOT / "lgb_val_rows.npy", valid_idx)
     np.save(ROOT / "lgb_val_pred.npy", pred)
     np.save(ROOT / "lgb_test_pred.npy", model.predict(x_test, num_threads=-1))
