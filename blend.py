@@ -29,9 +29,26 @@ assert seeds, "no seq_val_seed*.npy files found; run sequence_model.py first"
 preds = [on_scored(np.load(f), rows) for f in files]
 for s, p in zip(seeds, preds):
     print(f"seed {s}: {mae(p):.5f}")
-seq_val = np.mean(preds, axis=0)
-seq_test = np.mean([np.load(f"seq_test_seed{s}.npy") for s in seeds], axis=0)
-print(f"GRU ensemble ({len(seeds)} seeds): {mae(seq_val):.5f}")
+# MAE is minimised by a median-type predictor, so with >=3 seeds test mean vs median on validation.
+aggs = {"mean": lambda a: np.mean(a, axis=0)}
+if len(seeds) >= 3:
+    aggs["median"] = lambda a: np.median(a, axis=0)
+agg_scores = {k: mae(f(preds)) for k, f in aggs.items()}
+agg = min(agg_scores, key=agg_scores.get)
+print("GRU ensemble (" + str(len(seeds)) + " seeds): " + "  ".join(f"{k}={v:.5f}" for k, v in agg_scores.items()) + f"  -> using {agg}")
+seq_val = aggs[agg](preds)
+
+# Test predictions: prefer models trained on ALL breaths (sequence_model.py --full) when available;
+# the blend weight / clipping are still chosen on the validation models above.
+full_files = [f"seq_test_full_seed{s}.npy" for s in seeds]
+import os
+if all(os.path.exists(f) for f in full_files):
+    test_stack = [np.load(f) for f in full_files]
+    print("test predictions: using FULL-data models")
+else:
+    test_stack = [np.load(f"seq_test_seed{s}.npy") for s in seeds]
+    print("test predictions: using 85%-data validation models (run --full per seed for slightly better test results)")
+seq_test = aggs[agg](test_stack)
 
 # ---- 2. LightGBM blend ------------------------------------------------------
 lgb_val = lgb_test = None
