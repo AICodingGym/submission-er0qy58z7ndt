@@ -14,9 +14,14 @@ import pandas as pd
 tr = pd.read_csv("data/train.csv", usecols=["breath_id", "R", "C", "pressure", "u_out"])
 tr["step"] = tr.groupby("breath_id").cumcount()
 y, u = tr["pressure"].to_numpy(), tr["u_out"].to_numpy()
-lo, hi = float(y.min()), float(y.max())
 
 rows = np.load("seq_val_rows.npy")
+# Clipping bounds. For the VALIDATION comparison use only the training fold (rows NOT held out),
+# otherwise validation targets leak into the bounds. For the final TEST file all training rows are fine.
+held_out = np.zeros(len(y), dtype=bool); held_out[rows] = True
+lo_f, hi_f = float(y[~held_out].min()), float(y[~held_out].max())
+lo_all, hi_all = float(y.min()), float(y.max())
+print(f"clip bounds (training fold): [{lo_f:.3f}, {hi_f:.3f}]")
 scored = np.sort(rows[u[rows] == 0])
 truth = y[scored]
 mae = lambda p: float(np.abs(p - truth).mean())
@@ -66,7 +71,7 @@ results = []
 for clip in (False, True):
     for w in weights:
         v = w * seq_val + (1 - w) * lgb_val if lgb_val is not None else seq_val
-        results.append((mae(np.clip(v, lo, hi) if clip else v), float(w), clip))
+        results.append((mae(np.clip(v, lo_f, hi_f) if clip else v), float(w), clip))
 if lgb_val is not None:
     print("\nweight on GRU -> validation MAE (unclipped | clipped)")
     for w in weights:
@@ -78,7 +83,7 @@ print(f"\nchosen: GRU weight={best_w:.1f}, clip={best_clip}, validation MAE={bes
 
 # ---- 3. error breakdown of the chosen blend --------------------------------
 v = best_w * seq_val + (1 - best_w) * lgb_val if lgb_val is not None else seq_val
-v = np.clip(v, lo, hi) if best_clip else v
+v = np.clip(v, lo_f, hi_f) if best_clip else v
 err = pd.DataFrame({"R": tr["R"].to_numpy()[scored], "C": tr["C"].to_numpy()[scored],
                     "step": tr["step"].to_numpy()[scored], "abs_err": np.abs(v - truth)})
 print("\nMAE by (R, C):")
@@ -89,7 +94,7 @@ print(err.groupby(err["step"] // 5 * 5)["abs_err"].mean().round(4).to_string())
 # ---- 4. write the submission -----------------------------------------------
 final = best_w * seq_test + (1 - best_w) * lgb_test if lgb_val is not None else seq_test
 if best_clip:
-    final = np.clip(final, lo, hi)
+    final = np.clip(final, lo_all, hi_all)
 ids = pd.read_csv("data/test.csv", usecols=["id"])["id"].to_numpy()
 assert len(ids) == len(final) and np.isfinite(final).all()
 pd.DataFrame({"id": ids, "pressure": final}).to_csv("submission_blend.csv", index=False)
